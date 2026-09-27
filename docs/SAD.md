@@ -237,6 +237,30 @@ build-feature  run 7f3a   $1.84 / $5.00   612k tokens (cache hit 71%)
 
 Output is plain text by default; every command also supports `--json` for scripting.
 
+### Mermaid diagrams
+
+```
+agentp diagram <pipeline.yaml>            # structure: steps, loops, gates
+agentp diagram <run> [--costs] [--out run.md]   # what actually happened in a run
+```
+
+- **Pipeline mode** is generated from the compiled graph (§4) and shows the designed flow.
+- **Run mode** is rebuilt from the event stream (§5) and shows the path actually taken: every loop round as its own node, the gate decisions, the status of each step and, with `--costs`, tokens, cache hits and cost per step.
+- Output is Mermaid text (`flowchart`), printed to stdout or written to a `.md` file, so it renders in GitHub, IDEs and docs without extra tools. It can be generated while a run is still going; the active step is highlighted.
+
+Example of run mode:
+
+```mermaid
+flowchart LR
+  plan["✔ plan<br/>$0.21"] --> code["✔ code<br/>$0.93"]
+  code --> v1["✘ validate #1<br/>3 findings"] --> f1["✔ fix #1"]
+  f1 --> v2["✔ validate #2<br/>pass"]
+  v2 --> review{{"⏸ review<br/>approved"}}
+  review --> done(["done · $1.84"])
+  classDef fail fill:#fdd,stroke:#c33
+  class v1 fail
+```
+
 ## 12. Tech Choices (proposed)
 
 | Area | Choice | Why |
