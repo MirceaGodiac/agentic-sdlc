@@ -8,17 +8,16 @@ Software Architecture Document. Companion to [PRD.md](./PRD.md).
 2. **Every token is accounted for.** Usage and cost are recorded per model call, not estimated afterwards.
 3. **Pipelines are plain files.** They can be versioned, diffed and reviewed in git.
 4. **Providers are swappable.** Cursor and OpenAI in v1; adding one more should mean one new adapter.
-5. **Local first.** Single user, one machine, no server to operate.
+5. **Local first, CLI only.** Single user, one machine, no server, no web UI in v1.
 
 ## 2. System Overview
 
 ```
- ┌──────────────┐     ┌──────────────┐
- │  Web UI      │     │  CLI         │
- └──────┬───────┘     └──────┬───────┘
-        └──────── HTTP / WS ─┘
-                   │
- ┌─────────────────▼──────────────────────────────────────┐
+                ┌──────────────┐
+                │  CLI (agentp)│
+                └──────┬───────┘
+                       │  in-process
+ ┌─────────────────────▼──────────────────────────────────┐
  │                   Orchestrator (local)                 │
  │                                                        │
  │  Pipeline Loader ──► Run Engine ◄──► Gate Service      │
@@ -51,7 +50,7 @@ Software Architecture Document. Companion to [PRD.md](./PRD.md).
 | **Usage Meter** | Converts raw usage into tokens, cache reads/writes and cost using a versioned price table. |
 | **Budget Guard** | Checks limits before and after every call. Pauses or stops the run when a cap is hit. |
 | **Gate Service** | Stores pending approvals, sends notifications, applies timeouts, and feeds decisions back into the engine. |
-| **API + UI** | Local HTTP API with WebSocket live updates. The Web UI shows the pipeline graph, live runs, logs, gates and costs; the CLI covers the same actions. |
+| **CLI** | The only interface in v1. Starts and controls runs, streams live progress to the terminal, answers gates, and prints logs and cost reports (§11). |
 
 ## 4. Pipeline Model
 
@@ -125,13 +124,15 @@ RunStarted → StepStarted → ModelCalled → UsageRecorded → StepCompleted
 Run state is rebuilt by replaying events. This gives:
 - **Resume after a crash**: replay, find the last incomplete step, re-run only that step.
 - **Long waits at gates**: nothing is held in memory; a gate is just an open event.
-- **A full audit trail**: the run log in the UI is the event stream.
+- **A full audit trail**: `agentp logs` reads straight from the event stream.
 
 **Step states:** `pending → running → succeeded | failed | skipped`, where `failed` leads to a retry (with backoff, up to N times) or stops the run.
 
 **Concurrency:** one active step per run (no parallel steps in v1); several runs may execute at once.
 
-**Workspace:** each run gets its own **git worktree**. Code-editing agents work in it; steps pass references (commit SHA, file paths) instead of pasting whole files. A gate can show the diff between any two steps.
+**Workspace:** each run gets its own **git worktree**. Code-editing agents work in it; steps pass references (commit SHA, file paths) instead of pasting whole files. At a gate, the CLI can print the diff between any two steps.
+
+**Process model:** `agentp run` executes the run in the foreground and streams progress. With `--detach`, the run continues in a background process; `agentp attach <run>` reconnects to it. Because all state lives in SQLite, any CLI invocation can read or act on any run.
 
 ## 6. Context & Caching
 
@@ -170,7 +171,7 @@ type Usage = {
 ```
 
 - **OpenAI**: direct API. Prompt caching is automatic when prompts start with the same text; usage reports cached input tokens.
-- **Cursor**: accessed through its agent API or CLI. Exactly which usage and cache fields it exposes is still **to be verified** (PRD Q3). The adapter reports `null` for anything it can't observe, and the UI shows "not reported" rather than a guess.
+- **Cursor**: accessed through its agent API or CLI. Exactly which usage and cache fields it exposes is still **to be verified** (PRD Q3). The adapter reports `null` for anything it can't observe, and the CLI shows "not reported" rather than a guess.
 - API keys are stored in the OS keychain and never written to run logs.
 
 ## 8. Cost & Budgets
@@ -186,7 +187,8 @@ type Usage = {
 
 - A gate writes `GateOpened` with a snapshot of what to show, then the engine parks the run.
 - Decisions: **approve**, **reject** (end the run), **edit & continue** (the edited output replaces the step output and is logged as a human edit), **send back to step X** (re-enter the graph there).
-- Notifications go through a small interface: in-app in v1, with Slack and email as later plugins.
+- If the run is attached, the gate prompts in the terminal. Otherwise `agentp gates` lists pending gates and `agentp approve|reject|edit|sendback <gate>` decides them.
+- Notifications go through a small interface: a desktop notification in v1, with Slack and email as later plugins.
 - Timeouts are checked by a scheduler inside the orchestrator. They survive restarts because the deadline is stored in the event.
 
 ## 10. Data Model (SQLite)
@@ -205,27 +207,58 @@ Large outputs (patches, long text) are stored as files under `runs/<run-id>/` an
 
 A run records the pipeline's content hash, so editing a pipeline never changes the meaning of past runs.
 
-## 11. Tech Choices (proposed)
+## 11. CLI
+
+```
+agentp validate <pipeline.yaml>          # check pipeline + agents, show cache-sharing warnings
+agentp run <pipeline.yaml> [--input ..] [--detach]
+agentp ls                                # runs: status, current step, cost so far
+agentp attach <run>                      # live view of a running/waiting run
+agentp pause|resume|cancel <run>
+agentp gates                             # pending approvals
+agentp approve|reject <gate>
+agentp edit <gate>                       # opens output in $EDITOR, continues with the edit
+agentp sendback <gate> --to <step>
+agentp logs <run> [--step <id>] [--full] # prompts, responses, context given to each step
+agentp cost [<run>] [--by step|model|day]# tokens, cache read/write, cost, savings
+```
+
+Live view while a run is attached:
+
+```
+build-feature  run 7f3a   $1.84 / $5.00   612k tokens (cache hit 71%)
+  ✔ plan        gpt-…     12s   $0.21
+  ✔ code        gpt-…     48s   $0.93
+  ↻ validate-fix  round 2/5
+      ✔ validate          $0.18   FAIL (3 findings)
+      ● fix               running…
+  ○ review      gate
+```
+
+Output is plain text by default; every command also supports `--json` for scripting.
+
+## 12. Tech Choices (proposed)
 
 | Area | Choice | Why |
 |---|---|---|
-| Language | TypeScript (Node) | One language for engine, API and UI; good SDKs for both providers. |
-| Storage | SQLite | Zero setup, transactional, enough for single-user local use. |
-| API | HTTP + WebSocket | Live step streaming to the UI. |
-| UI | React, served locally | Graph view, logs, gates, cost charts. |
+| Language | TypeScript (Node) | Good SDKs for both providers; easy to distribute as one CLI. |
+| Storage | SQLite | Zero setup, transactional, and lets any CLI process see every run. |
+| Terminal UI | Ink or plain ANSI output | Live step view without a web stack. |
 | Config | YAML + Markdown | Readable, diffable, lives in git. |
 
-## 12. Risks
+A web UI can be added later on top of the same SQLite store without changing the engine.
+
+## 13. Risks
 
 | Risk | Mitigation |
 |---|---|
-| Cursor exposes little usage or cache data | Adapter reports what it can; the UI marks gaps; OpenAI remains the reference provider for exact accounting. |
+| Cursor exposes little usage or cache data | Adapter reports what it can; the CLI marks gaps; OpenAI remains the reference provider for exact accounting. |
 | Runaway loops burn budget | `max_iterations` is required, Budget Guard checks before every call, and a gate opens by default when the limit is hit. |
 | Cache savings lower than expected | Measure per step, show hit rate, and have the Cache Planner warn at load time. |
 | Prices change | Versioned price table; each usage record keeps the price version it used. |
 | Long-waiting runs go stale (e.g. repo moved on) | A gate shows how far the run's worktree is behind its base branch; "send back to step X" allows re-running. |
 
-## 13. Answers to PRD Open Questions (proposed)
+## 14. Answers to PRD Open Questions (proposed)
 
 | PRD Q | Proposal |
 |---|---|
