@@ -13,6 +13,7 @@ A tool where you **describe a pipeline of agents once**, then **run it, watch it
 - Agents pass context to each other and reuse cached prompts written by earlier agents.
 - Every run is tracked: tokens, cache, cost, time, outcome.
 - Agents run through **Cursor** or **OpenAI** using your own API key.
+- v1 is a **command-line tool**: everything is done from the terminal.
 
 ## 3. Users
 
@@ -74,21 +75,22 @@ Planner ──► Coder ──► ┌─ Validator ─► pass? ─┐ ──►
 
 ### Monitoring
 - Per step and per run: **input tokens, output tokens, cache reads, cache writes, cost, duration**.
-- Live view of the running pipeline: which step is active, what it's producing.
+- Live terminal view of the running pipeline: which step is active, what it's producing.
 - Full log of every step: prompt sent, response received, decisions made.
 - Generate a **Mermaid diagram** of a pipeline (designed flow) or of a run (actual path, loop rounds, gate decisions, costs).
 - Cost totals per run, per pipeline, per day.
 - **Budget limits**: stop or pause a run when it passes a set cost or token cap.
 
 ### Human gates
-- Notify when a run is waiting (in-app to start; later Slack/email).
+- Gates are answered in the terminal: prompted directly if you're watching the run, or later via CLI commands.
+- Notify when a run is waiting (desktop notification to start; later Slack/email).
 - Gates can have a timeout with a default action (approve / reject / keep waiting).
 
 ## 7. Out of Scope (v1)
 
 - Running steps in parallel.
 - Multi-user teams, roles, permissions.
-- A drag-and-drop visual editor (config files first; a read-only visual view is fine).
+- Any web or graphical UI. v1 is CLI only; visual overviews come from generated Mermaid diagrams.
 - Providers beyond Cursor and OpenAI.
 - Hosting as a SaaS — v1 runs locally.
 
