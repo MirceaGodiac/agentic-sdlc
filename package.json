@@ -1,0 +1,33 @@
+{
+  "name": "agentp",
+  "version": "0.1.0",
+  "description": "Agent Pipeline Orchestrator: define, run and monitor pipelines of AI agents from the terminal.",
+  "type": "module",
+  "bin": {
+    "agentp": "bin/agentp.js"
+  },
+  "files": [
+    "bin",
+    "dist",
+    "prices.yaml"
+  ],
+  "engines": {
+    "node": ">=22.13"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "dev": "node --no-warnings=ExperimentalWarning --import tsx src/cli/main.ts"
+  },
+  "dependencies": {
+    "commander": "^14.0.0",
+    "yaml": "^2.8.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.20.0",
+    "tsx": "^4.20.0",
+    "typescript": "^5.9.3",
+    "vitest": "^3.2.0"
+  }
+}

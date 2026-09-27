@@ -126,7 +126,7 @@ Run state is rebuilt by replaying events. This gives:
 - **Long waits at gates**: nothing is held in memory; a gate is just an open event.
 - **A full audit trail**: `agentp logs` reads straight from the event stream.
 
-**Step states:** `pending → running → succeeded | failed | skipped`, where `failed` leads to a retry (with backoff, up to N times) or stops the run.
+**Step states:** `pending → running → succeeded | failed`, where `failed` leads to a retry (with backoff, `retries` times, default 2) or stops the run. Only real errors count against retries; a budget pause, a cancellation or a crash does not.
 
 **Concurrency:** one active step per run (no parallel steps in v1); several runs may execute at once.
 
@@ -134,25 +134,38 @@ Run state is rebuilt by replaying events. This gives:
 
 **Process model:** `agentp run` executes the run in the foreground and streams progress. With `--detach`, the run continues in a background process; `agentp attach <run>` reconnects to it. Because all state lives in SQLite, any CLI invocation can read or act on any run.
 
+- One process drives a run at a time, enforced by a lock row holding the driver's pid. A lock whose process has died is taken over, which is how a crashed run is resumed.
+- A background driver exits when the run reaches a gate: nothing is held in memory while waiting. `agentp approve|edit|sendback` records the decision and then continues the run (in the foreground, or with `--detach` in the background).
+- A foreground driver at a gate prompts in the terminal and at the same time watches the store, so a decision made from another terminal also unblocks it.
+- A step left `running` by a process that died is recorded as failed (`cause: interrupted`, which does not use up retries) and re-run.
+- Ctrl-C pauses the run after the current step; a second Ctrl-C exits at once.
+
 ## 6. Context & Caching
 
 **Context assembly order** (most stable first):
 
 ```
-1. Agent instructions (.md)           ─┐
-2. Pipeline shared_context files       │  stable prefix → cacheable
-3. Earlier outputs, oldest first      ─┘
-4. Loop history / latest findings     ─┐  changes every call
-5. The step's specific task            ─┘
+1. Fixed preamble (same for every step) ─┐
+2. Pipeline shared_context files         │  shared prefix: the same for every step that
+3. Run input, files, earlier outputs     │  declares the same inputs, so one step's cache
+   (oldest first)                       ─┘  serves the next
+4. Agent instructions (.md)                 stable per agent, so loop rounds reuse it too
+5. Outputs the current loop rewrites,   ─┐
+   loop history, notebook                │  changes every call
+6. The step's specific task             ─┘
 ```
 
 - Keeping this order fixed means step N+1 usually starts with the same text step N already sent, so the provider's prompt cache serves it.
+- Agent instructions come *after* the shared parts. Each agent's instructions differ, so putting them first (as an earlier draft of this document did) would stop any two different agents from ever sharing a cached prefix.
+- An output that any step of the current loop rewrites (e.g. `patch` in validate/fix) always goes in the tail, even in round 1, so every round sends an identical prefix.
 - The **Cache Planner** (part of Context Builder) warns at load time when steps that could share a prefix use different providers or models, because caches don't carry across them.
 - `cache: isolated` agents get a fresh context with none of the shared prefix. Use this for independent reviewers.
-- **Oversized context** is replaced by a stored summary or a file reference. The substitution is logged so it's visible.
+- **Oversized context** (over `max_input_chars`, default 60,000) is replaced by its first 4,000 characters and a file reference the agent can open with `read_file("artifact:…")`. The substitution is logged so it's visible. Model-written summaries are a later addition.
 - **Run notebook**: a key/value store per run that any agent can read and append to through a tool call. Its contents go in the non-cached tail.
 
-Cache effect is **measured, not assumed**: the Usage Meter records cached tokens per call as reported by the provider and attributes savings to the step that first wrote the prefix.
+Cache effect is **measured, not assumed**: the Usage Meter records cached tokens per call as reported by the provider and attributes savings to the step that first wrote the prefix. To do that, the Context Builder stores a hash of the prompt after each prefix part; the earliest step on the same provider/model with the longest matching run of hashes is the source.
+
+Structured output (`response_format` with a JSON schema) is used for validators even though OpenAI caches the schema as part of the prefix. A reliable loop exit condition matters more than the cache hit on that one call.
 
 ## 7. Providers
 
@@ -171,7 +184,8 @@ type Usage = {
 ```
 
 - **OpenAI**: direct API. Prompt caching is automatic when prompts start with the same text; usage reports cached input tokens.
-- **Cursor**: accessed through its agent API or CLI. Exactly which usage and cache fields it exposes is still **to be verified** (PRD Q3). The adapter reports `null` for anything it can't observe, and the CLI shows "not reported" rather than a guess.
+- **Cursor** (experimental): v1 runs Cursor's headless agent CLI (`cursor-agent --print --output-format json`) in the run's worktree, where Cursor uses its own tools. Exactly which usage and cache fields it exposes is still **to be verified** (PRD Q3). The adapter reports `null` for anything it can't observe, and the CLI shows "not reported" rather than a guess.
+- Agents on OpenAI get agentp's own tools, chosen per agent in front-matter (`tools: [read_file, write_file, list_files, run_command, notebook]`). File tools are confined to the run's worktree.
 - API keys are stored in the OS keychain and never written to run logs.
 
 ## 8. Cost & Budgets
@@ -179,9 +193,11 @@ type Usage = {
 - **Price table**: a versioned file (`prices.yaml`) with prices per model for input, output, cache-read and cache-write tokens. Each usage record stores the price version it was calculated with, so old runs keep their original cost after prices change.
 - If the provider reports cost directly, that figure wins over the calculated one.
 - **Budget Guard** checks:
-  - *before* a call: estimated cost of this call + spent so far ≤ cap, otherwise pause at an automatic gate
-  - *after* a call: actual cost is recorded, and the run stops if the hard cap is exceeded
-- Caps can be set per run, per pipeline per day, and globally per day.
+  - *before* a call: can the remaining budget pay for the (estimated) input? If so, the call's `max_output_tokens` is lowered so the output cannot push spend over the cap either. If not, the run pauses at an automatic `budget` gate, which is approved with a new run cap (`agentp approve <run> --budget 10`) or rejected.
+  - *after* a call: actual cost is recorded, and the run stops (`budget_exceeded`) if a hard cap was still passed.
+  - This runs before every model call, including each turn of a tool-using agent.
+- Caps can be set per run (`budget.max_cost_usd`, `budget.max_tokens`), per pipeline per day (`budget.max_cost_usd_per_day`), and globally per day (`budget.max_cost_usd_per_day` in `<home>/config.yaml`).
+- A cap that cannot be enforced is refused up front: `agentp run` stops if a cost cap is set but a model has no price, or if a step uses a provider that does not report usage (unless `--allow-unmetered`).
 
 ## 9. Gates & Notifications
 
@@ -205,7 +221,9 @@ gates(id, run_id, step_id, status, deadline, decision, decided_at)
 
 Large outputs (patches, long text) are stored as files under `runs/<run-id>/` and referenced from the tables.
 
-A run records the pipeline's content hash, so editing a pipeline never changes the meaning of past runs.
+A run records the pipeline's content hash, so editing a pipeline never changes the meaning of past runs. The `RunStarted` event also holds the full compiled pipeline (agent instructions and shared files inlined), and resuming a run uses that snapshot, not the files on disk.
+
+Storage layout: `<home>/agentp.db`, `<home>/runs/<run>/{prompts,outputs,context}/`, `<home>/worktrees/<run>/`. The home is `--home`, `$AGENTP_HOME`, the nearest `.agentp/` above the current directory, or `./.agentp`.
 
 ## 11. CLI
 
@@ -220,7 +238,9 @@ agentp approve|reject <gate>
 agentp edit <gate>                       # opens output in $EDITOR, continues with the edit
 agentp sendback <gate> --to <step>
 agentp logs <run> [--step <id>] [--full] # prompts, responses, context given to each step
-agentp cost [<run>] [--by step|model|day]# tokens, cache read/write, cost, savings
+agentp cost [<run>] [--by step|model|day|pipeline|run]  # tokens, cache read/write, cost, savings
+agentp diff <run> [--from <step>] [--to <step>]           # code changes between steps
+agentp keys set|delete <provider>                         # API keys in the OS keychain
 ```
 
 Live view while a run is attached:
@@ -261,14 +281,15 @@ flowchart LR
   class v1 fail
 ```
 
-## 12. Tech Choices (proposed)
+## 12. Tech Choices
 
 | Area | Choice | Why |
 |---|---|---|
-| Language | TypeScript (Node) | Good SDKs for both providers; easy to distribute as one CLI. |
-| Storage | SQLite | Zero setup, transactional, and lets any CLI process see every run. |
-| Terminal UI | Ink or plain ANSI output | Live step view without a web stack. |
+| Language | TypeScript (Node ≥ 22.13) | Good SDKs for both providers; easy to distribute as one CLI. |
+| Storage | SQLite via Node's built-in `node:sqlite` | Zero setup, transactional, lets any CLI process see every run, and no native module to compile. |
+| Terminal UI | Plain ANSI output | Live step view without a web stack or a UI framework; falls back to plain log lines when not a TTY. |
 | Config | YAML + Markdown | Readable, diffable, lives in git. |
+| OpenAI | `fetch` against Chat Completions (streaming) | Full control over usage parsing and tool calls; no SDK dependency. |
 
 A web UI can be added later on top of the same SQLite store without changing the engine.
 

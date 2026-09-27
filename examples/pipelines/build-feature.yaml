@@ -1,0 +1,37 @@
+# The PRD example: plan → code → validate/fix loop → human review.
+# Run from the root of the repository the agents should work on:
+#   agentp run path/to/build-feature.yaml --input "Add a --verbose flag to the CLI"
+name: build-feature
+budget: { max_cost_usd: 5, max_tokens: 2_000_000 }
+shared_context: [../docs/PROJECT.md]   # cached prefix for every step
+
+steps:
+  - id: plan
+    agent: ../agents/planner.md
+    inputs: [run.input]
+    output: plan
+
+  - id: code
+    agent: ../agents/coder.md
+    inputs: [plan]
+    output: patch
+
+  - loop:
+      id: validate-fix
+      max_iterations: 5
+      until: validate.verdict == "pass"
+      steps:
+        - id: validate
+          agent: ../agents/validator.md
+          inputs: [plan, patch]
+          output: findings          # {verdict, findings}
+        - id: fix
+          agent: ../agents/fixer.md
+          inputs: [plan, patch, findings, loop.history]
+          output: patch
+
+  - gate:
+      id: review
+      show: [plan, patch, findings]
+      timeout: 24h
+      on_timeout: wait
