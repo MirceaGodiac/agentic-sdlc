@@ -76,6 +76,7 @@ Planner ──► Coder ──► ┌─ Validator ─► pass? ─┐ ──►
 - Per step and per run: **input tokens, output tokens, cache reads, cache writes, cost, duration**.
 - Live view of the running pipeline: which step is active, what it's producing.
 - Full log of every step: prompt sent, response received, decisions made.
+- Generate a **Mermaid diagram** of a pipeline (designed flow) or of a run (actual path, loop rounds, gate decisions, costs).
 - Cost totals per run, per pipeline, per day.
 - **Budget limits**: stop or pause a run when it passes a set cost or token cap.
 
