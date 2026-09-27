@@ -10,6 +10,7 @@ A tool where you **describe a pipeline of agents once**, then **run it, watch it
 
 - Each agent is defined by a Markdown file (its instructions).
 - Agents are wired into a flow: steps, loops, and human approval gates.
+- Agents pass context to each other and reuse cached prompts written by earlier agents.
 - Every run is tracked: tokens, cache, cost, time, outcome.
 - Agents run through **Cursor** or **OpenAI** using your own API key.
 
@@ -28,7 +29,8 @@ A tool where you **describe a pipeline of agents once**, then **run it, watch it
 | **Loop** | Repeat a group of steps until a condition is met or a limit is hit (e.g. validator → fixer until the validator passes, max 5 rounds). |
 | **Gate** | A pause that waits for a human to approve, reject, or edit before continuing. |
 | **Run** | One execution of a pipeline, with its full history and costs. |
-| **Context** | What flows between steps: previous outputs, attached files, shared notes. |
+| **Context** | What flows between steps: previous outputs, attached files, shared notes. Explicitly declared per step. |
+| **Cache** | Prompt-cache entries written by one step that later steps can read instead of paying for the same tokens again. |
 
 ## 5. Example
 
@@ -46,6 +48,22 @@ Planner ──► Coder ──► ┌─ Validator ─► pass? ─┐ ──►
 - Define loops with an **exit condition** (e.g. validator says "PASS") and a **hard max** on iterations.
 - Insert gates anywhere. A gate shows the current output and offers: Approve / Reject / Edit & continue / Send back to step X.
 - Save pipelines as plain files (YAML/JSON + `.md`) so they can live in git.
+
+### Context passing
+- Each step declares what it **receives** (inputs) and what it **hands on** (outputs).
+- Sources a step can pull from: the output of any earlier step (not just the one before it), the run's input, attached files, and a shared **run notebook** that any agent can read and append to.
+- Outputs can be named (e.g. `plan`, `review_findings`) so later steps reference them by name.
+- In loops, the fixer gets the validator's latest findings plus a short history of earlier rounds, so it doesn't repeat failed fixes.
+- Large context can be passed as a summary or a file reference instead of full text, to control token use.
+- The context handed to each step is visible in the run log — you can always see exactly what an agent was given.
+
+### Cache sharing
+- When a step writes to the provider's prompt cache, later steps should **reuse it instead of paying for it again**.
+- The orchestrator builds prompts in a fixed order, stable parts first (shared system/project context, files, earlier outputs), changing parts last, so later steps start with the same cached prefix.
+- Steps that share a prefix are grouped to run on the same provider/model, since caches don't carry across providers or models.
+- Loop rounds reuse the cached prefix, so only the new findings or changes cost full price.
+- Cache hits, misses and savings are reported per step, e.g. "Step 4 read 38k cached tokens from Step 2, saving $0.41".
+- A step can opt out of the shared cache when it needs a clean, isolated context (e.g. an independent reviewer).
 
 ### Running
 - Start a run with an input (a task description, a repo, files).
@@ -87,3 +105,4 @@ Planner ──► Coder ──► ┌─ Validator ─► pass? ─┐ ──►
 3. Cursor: use its background-agent API, its CLI, or both? What usage/cost data does it expose?
 4. Should gates allow editing the agent's `.md` mid-run, or only the output?
 5. Where do run histories live — local files, SQLite, or something else?
+6. How much control does each provider give over caching? OpenAI caches automatically when prompts start with the same prefix; Cursor's behaviour is unknown. Do we only report cache usage, or also try to shape prompts for reuse?
